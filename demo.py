@@ -62,6 +62,11 @@ lib.initialize_cudf()
 output = ffi.new("struct ArrowDeviceArray*")
 lib.get_data_cudf(output)
 
+print(f"output.device_type: {output.device_type} -> should be 2 for ARROW_DEVICE_CUDA")
+assert output.device_type == 2
+print(f"output.device_id: {output.device_id}")
+numba.cuda.select_device(output.device_id)
+
 # second column is a float64 column, lets use that
 # grab the data buffer of the column
 ptr = int(ffi.cast('uintptr_t', output.array.children[1].buffers[1]))
