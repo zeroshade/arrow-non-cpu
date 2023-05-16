@@ -12,7 +12,7 @@ find_package(cudf REQUIRED)
 #                src/main.cc
 #                src/to_arrow_device_array.cc)
 add_library(cudf-demo SHARED
-            src/main.cc
+            src/main.cc            
             src/to_arrow_device_array.cc)
 target_link_libraries(cudf-demo PRIVATE cudf::cudf)
 target_compile_features(cudf-demo PRIVATE cxx_std_20)

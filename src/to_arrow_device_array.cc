@@ -61,6 +61,35 @@ void dispatch_to_arrow_cdata::operator()<cudf::string_view>(
     out->buffers[2] = input_view.child(1).data<const char>();
 }
 
+struct dev_ctx {
+    std::unique_ptr<cudf::column> col;
+    cudaEvent_t ev;
+};
+
+void to_arrow_device_arr(std::unique_ptr<cudf::column> col, struct ArrowDeviceArray* out) {
+    memset(out, 0, sizeof(struct ArrowDeviceArray));
+
+    int device;
+    cudaGetDevice(&device);
+    
+    out->device_id = static_cast<int64_t>(device);
+    out->device_type = ARROW_DEVICE_CUDA;
+    auto view = col->view();
+    cudf::type_dispatcher(view.type(), dispatch_to_arrow_cdata{}, view, view.type().id(), &out->array);
+    out->array.release = [](struct ArrowArray* arr) {
+        free(arr->buffers);
+        auto self_ctx = reinterpret_cast<dev_ctx*>(arr->private_data);
+        cudaEventDestroy(self_ctx->ev);
+        delete self_ctx;
+    };
+
+    auto* ctx = new dev_ctx;    
+    cudaEventCreate(&ctx->ev);
+    ctx->col = std::move(col);
+
+    out->sync_event = reinterpret_cast<void*>(ctx->ev);
+    out->array.private_data = reinterpret_cast<void*>(ctx);
+}
 
 void to_arrow_device_arr(std::unique_ptr<cudf::table> tbl, struct ArrowDeviceArray* out) {
     memset(out, 0, sizeof(struct ArrowDeviceArray));

@@ -19,7 +19,9 @@
 #include "helpers.h"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/groupby.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/io/csv.hpp>
 #include <cudf/table/table.hpp>
 
@@ -27,6 +29,7 @@
 #include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/mr/device/pool_memory_resource.hpp>
 
+#include <iostream>
 #include <memory>
 #include <string>
 #include <utility>
@@ -103,6 +106,42 @@ void get_data_cudf(struct ArrowDeviceArray* output) {
   auto result = average_closing_price(*stock_table_with_metadata.tbl);
 
   to_arrow_device_arr(std::move(result), output);
+}
+
+int get_sum(struct ArrowDeviceArray* input, struct ArrowDeviceArray* output) {
+  cudaSetDevice(input->device_id);  
+
+  // for now we're going to assume float32, but you could pass a struct ArrowSchema*
+  // to pass the type information alongside the input
+  auto ev = reinterpret_cast<cudaEvent_t>(input->sync_event);
+  auto evstatus = cudaEventQuery(ev);
+  if (evstatus != cudaSuccess) {
+    std::cout << cudaGetErrorName(evstatus) << " " << cudaGetErrorString(evstatus) << std::endl;
+    return 1;
+  }
+  std::cout << "ev status " << evstatus << std::endl;
+  auto status = cudaStreamWaitEvent(cudf::get_default_stream(), ev);
+  if (status != cudaSuccess) {
+    std::cout << cudaGetErrorName(status) << " " << cudaGetErrorString(status) << std::endl;
+    return 1;
+  }
+
+  auto col = cudf::column_view(cudf::data_type(cudf::type_id::FLOAT32), 
+                               static_cast<cudf::size_type>(input->array.length), 
+                               input->array.buffers[1],
+                               static_cast<cudf::bitmask_type const*>(input->array.buffers[0]), 
+                               static_cast<cudf::size_type>(input->array.null_count));
+
+  auto sumagg = cudf::make_sum_aggregation();
+  auto scalar = cudf::reduce(col, 
+                             *dynamic_cast<cudf::reduce_aggregation*>(sumagg.get()), 
+                             cudf::data_type(cudf::type_id::FLOAT32));
+
+  auto result = cudf::make_column_from_scalar(*scalar, 1);
+  to_arrow_device_arr(std::move(result), output);
+  cudaEventRecord(reinterpret_cast<cudaEvent_t>(output->sync_event), cudf::get_default_stream());
+  
+  return 0;
 }
 
 void cleanup_cudf() {
