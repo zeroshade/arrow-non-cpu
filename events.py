@@ -1,18 +1,18 @@
 from ffi_headers import ffi, release_callback
-import warnings
+from ctypes import c_voidp, addressof
 from time import perf_counter, sleep
 import numpy as np
 import numba
 from numba import cuda
-from numba.core.errors import NumbaPerformanceWarning
 
 print(np.__version__)
 print(numba.__version__)
 
-warnings.simplefilter("ignore", category=NumbaPerformanceWarning)
-
 lib = ffi.dlopen("./build/libcudf-demo.so")
 lib.initialize_cudf()
+
+# sample numba cuda code adapted from 
+# https://towardsdatascience.com/cuda-by-numba-examples-7652412af1ee
 
 threads_per_block = 256
 blocks_per_grid = 32 * 40
@@ -41,13 +41,6 @@ def partial_reduce(array, partial_reduction):
         partial_reduction[cuda.blockIdx.x] = s_block[0]
 
 @cuda.jit
-def single_thread_sum(partial_reduction, sum):
-    sum[0] = 0.0
-    for element in partial_reduction:
-        sum[0] += element
-
-
-@cuda.jit
 def divide_by(array, val_array):
     i_start = cuda.grid(1)
     threads_per_grid = cuda.gridsize(1)
@@ -58,51 +51,58 @@ def divide_by(array, val_array):
 def to_arrow_device_arr(arr, ev):
     out = ffi.new("struct ArrowDeviceArray*")
     out.device_id = cuda.get_current_device().id
-    out.device_type = 2 # ARROW_DEVICE_CUDA
-    h = ffi.from_buffer(ev.handle)
-    out.sync_event = ffi.cast("void*", h)
-    
+    out.device_type = 2 # ARROW_DEVICE_CUDA    
+    out.sync_event = ffi.cast('void*', ffi.cast('uintptr_t', addressof(ev.handle)))    
     out.array.length = arr.size
     out.array.null_count = 0
     out.array.offset = 0
     out.array.n_buffers = 2
-    out.array.n_children = 0
-    buffers = ffi.new("void*[2]")    
-    buf = ffi.from_buffer(arr.device_ctypes_pointer)
-    buffers[1] = ffi.cast("void*", buf)
-    out.array.buffers = buffers
-    out.array.private_data = ffi.new_handle(buffers)
+    out.array.n_children = 0        
+    out.array.buffers = ffi.new("void*[2]")
+    out.array.buffers[1] = ffi.cast("void*", ffi.cast('uintptr_t', arr.device_ctypes_pointer.value))
+    out.array.private_data = ffi.new_handle(out.array.buffers)    
     out.array.release = release_callback
     return out
 
-def call_release_devarr(arr):
-    arr.array.release(ffi.addressof(arr.array))
-
 class ArrowDevArrayF32:
-    def __init__(self, arr):
-        self._arr = ffi.gc(arr, call_release_devarr, 0)
+    """Simple little class to wrap an ArrowDeviceArray"""
+    def __init__(self):
+        self._arr = ffi.new("struct ArrowDeviceArray*")
+        # okay technically to "properly" handle the memory
+        # this we should be calling arr.array.release
+        # when this gets cleaned up, but I'm not going to deal with
+        # that for this toy example        
 
     def get_event(self):
-        return cuda.driver.Event(cuda.current_context(), self._arr.sync_event)
+        h = c_voidp.from_address(int(ffi.cast('uintptr_t', self._arr.sync_event)))
+        return cuda.driver.Event(cuda.current_context(), h)
+
+    @property
+    def c_arr(self):
+        return self._arr
 
     @property
     def __cuda_array_interface__(self):
+        # use the CAI to provide the pointers and info directly to
+        # numba so it can use the passed array
         return {
-            'shape': tuple(self._arr.array.length),
+            'shape': (self._arr.array.length,),
             'strides': None,
             # assume float32 for now, could use ArrowSchema to indicate the
             # type properly, but not doing that in this demo
-            'typestr': 'f32', 
+            'typestr': 'float32',
             # we're gonna manually sync via the event instead!
             'stream': None,
-            'data': (int(ffi.cast('uintptr_t', self._arr.array.buffers[1]))),
-            'version': 3,            
+            'data': (int(ffi.cast('uintptr_t', self._arr.array.buffers[1])), True),
+            'version': 3,
         }
 
 # Define host array
 a = np.ones(10_000_000, dtype=np.float32)
 print(f"Old sum: {a.sum():.2f}")
 
+# this event will denote when the partial reduce is complete
+# so that the C++ side can wait on it before computing the sum
 event_ready = cuda.event()
 
 # Pin memory
@@ -113,26 +113,30 @@ with cuda.pinned(a):
     # Array copy to device and creation in the device. With Numba, you pass the
     # stream as an additional to API functions.
     dev_a = cuda.to_device(a, stream=stream)
-    dev_a_reduce = cuda.device_array((blocks_per_grid,), dtype=dev_a.dtype, stream=stream)
-    dev_a_sum = cuda.device_array((1,), dtype=dev_a.dtype, stream=stream)
+    dev_a_reduce = cuda.device_array((blocks_per_grid,), dtype=dev_a.dtype, stream=stream)    
 
     # When launching kernels, stream is passed to the kernel launcher ("dispatcher")
     # configuration, and it comes after the block dimension (`threads_per_block`)
     partial_reduce[blocks_per_grid, threads_per_block, stream](dev_a, dev_a_reduce)
+    # add a record on the stream for this event so we can sync on it
     event_ready.record(stream=stream)
 
+    # create the struct ArrowDeviceArray from the numba.DeviceNDArray
     c_dev_a_reduce = to_arrow_device_arr(dev_a_reduce, event_ready)
-    output = ffi.new("struct ArrowDeviceArray*")
-    st = lib.get_sum(c_dev_a_reduce, output)
+    # create output struct and call the C++ function which will
+    # use libcudf to compute the sum of the column and return it as a
+    # single element array
+    output = ArrowDevArrayF32()    
+    st = lib.get_sum(c_dev_a_reduce, output.c_arr)
     if st != 0:
-        raise Exception
-
-    # single_thread_sum[1, 1, stream](dev_a_reduce, dev_a_sum)
-
-    arrowdev = ArrowDevArrayF32(output)
-    ev = arrowdev.get_event()
+        raise Exception    
+    
+    # get the event so we can tell the stream to wait until the c++ side
+    # completes the sum to sync between the streams
+    ev = output.get_event()
     ev.wait(stream=stream)
 
+    dev_a_sum = cuda.as_cuda_array(output, sync=False)
     divide_by[blocks_per_grid, threads_per_block, stream](dev_a, dev_a_sum)
 
     # Array copy to host: like the copy to device, when a stream is passed, the copy
@@ -144,9 +148,8 @@ with cuda.pinned(a):
 # the point of view of the host, we call:
 stream.synchronize()
 
-print(a)
 # After that call, we can be sure that `a` has been overwritten with its
 # normalized version
 print(f"New sum: {a.sum():.2f}")
-
+# should print New sum: 1.00
 lib.cleanup_cudf()

@@ -57,5 +57,6 @@ ffi = cffi.FFI()
 ffi.cdef(funcs)
 
 @ffi.callback("void(struct ArrowArray*)")
-def release_callback(arr):
-    ffi.release(ffi.from_handle(arr.private_data))
+def release_callback(arr):    
+    # do some cleanup if you like
+    pass

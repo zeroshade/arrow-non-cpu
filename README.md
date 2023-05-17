@@ -41,4 +41,22 @@ cmake --build build/ --config Release
 ```
 
 This will build `libcudf-demo.so` in the `build/` subdirectory. After that
-you can run `demo.py` as long as `numba` and `numpy` are installed. 
+you can run `demo.py` and/or `events.py` as long as `numba` and `numpy`
+are installed. 
+
+## Examples
+
+`demo.py` is a very simple case that uses libcudf to read a csv file into
+a `cudf::table`, performs an aggregation, and then returns the table as 
+an `ArrowDeviceArray` so that numba can import the device pointers. It 
+then copies the result to the host via numba to confirm it got the
+expected data. This is based on the [`basic`](https://github.com/rapidsai/cudf/tree/branch-23.06/cpp/examples/basic) example from libcudf.
+
+`events.py` uses numba to perform a partial reduce of a device array,
+then pass the device array to C++ using `ArrowDeviceArray` so it can
+compute the sum of the reduced array (without leaving the GPU) using
+libcudf. The result is then returned for numba to perform a division
+on every element by the sum. Events are used to sync between the 
+operations in numba and libcudf which will be on different streams.
+This is based on the "Stream Semantics in Numba CUDA" tutorial located
+at https://towardsdatascience.com/cuda-by-numba-examples-7652412af1ee

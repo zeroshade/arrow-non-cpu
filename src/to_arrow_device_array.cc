@@ -87,7 +87,7 @@ void to_arrow_device_arr(std::unique_ptr<cudf::column> col, struct ArrowDeviceAr
     cudaEventCreate(&ctx->ev);
     ctx->col = std::move(col);
 
-    out->sync_event = reinterpret_cast<void*>(ctx->ev);
+    out->sync_event = reinterpret_cast<void*>(&ctx->ev);
     out->array.private_data = reinterpret_cast<void*>(ctx);
 }
 
