@@ -11,7 +11,7 @@ print(numba.__version__)
 lib = ffi.dlopen("./build/libcudf-demo.so")
 lib.initialize_cudf()
 
-# sample numba cuda code adapted from 
+# sample numba cuda code adapted from
 # https://towardsdatascience.com/cuda-by-numba-examples-7652412af1ee
 
 threads_per_block = 256
@@ -51,16 +51,20 @@ def divide_by(array, val_array):
 def to_arrow_device_arr(arr, ev):
     out = ffi.new("struct ArrowDeviceArray*")
     out.device_id = cuda.get_current_device().id
-    out.device_type = 2 # ARROW_DEVICE_CUDA    
-    out.sync_event = ffi.cast('void*', ffi.cast('uintptr_t', addressof(ev.handle)))    
+    out.device_type = 2 # ARROW_DEVICE_CUDA
+    # gotta play some games since numba uses ctypes and I decided
+    # to use ffi to call the shared lib.
+    # the void* we want is actually the address of ev.handle as ev.handle
+    # is the cudaEvent_t itself.
+    out.sync_event = ffi.cast('void*', ffi.cast('uintptr_t', addressof(ev.handle)))
     out.array.length = arr.size
     out.array.null_count = 0
     out.array.offset = 0
     out.array.n_buffers = 2
-    out.array.n_children = 0        
+    out.array.n_children = 0
     out.array.buffers = ffi.new("void*[2]")
     out.array.buffers[1] = ffi.cast("void*", ffi.cast('uintptr_t', arr.device_ctypes_pointer.value))
-    out.array.private_data = ffi.new_handle(out.array.buffers)    
+    out.array.private_data = ffi.new_handle(out.array.buffers)
     out.array.release = release_callback
     return out
 
@@ -71,9 +75,13 @@ class ArrowDevArrayF32:
         # okay technically to "properly" handle the memory
         # this we should be calling arr.array.release
         # when this gets cleaned up, but I'm not going to deal with
-        # that for this toy example        
+        # that for this toy example
 
     def get_event(self):
+        # the handle for the event in numba expects to be the cudaEvent_t
+        # itself, but we get a void* which is really a cudaEvent_t*
+        # so we need to play some games between ffi and ctypes in order
+        # to properly have a valid address here to use as a handle.
         h = c_voidp.from_address(int(ffi.cast('uintptr_t', self._arr.sync_event)))
         return cuda.driver.Event(cuda.current_context(), h)
 
@@ -86,6 +94,7 @@ class ArrowDevArrayF32:
         # use the CAI to provide the pointers and info directly to
         # numba so it can use the passed array
         return {
+            # it's a single dimension array so just a tuple with one value
             'shape': (self._arr.array.length,),
             'strides': None,
             # assume float32 for now, could use ArrowSchema to indicate the
@@ -113,7 +122,7 @@ with cuda.pinned(a):
     # Array copy to device and creation in the device. With Numba, you pass the
     # stream as an additional to API functions.
     dev_a = cuda.to_device(a, stream=stream)
-    dev_a_reduce = cuda.device_array((blocks_per_grid,), dtype=dev_a.dtype, stream=stream)    
+    dev_a_reduce = cuda.device_array((blocks_per_grid,), dtype=dev_a.dtype, stream=stream)
 
     # When launching kernels, stream is passed to the kernel launcher ("dispatcher")
     # configuration, and it comes after the block dimension (`threads_per_block`)
@@ -126,11 +135,11 @@ with cuda.pinned(a):
     # create output struct and call the C++ function which will
     # use libcudf to compute the sum of the column and return it as a
     # single element array
-    output = ArrowDevArrayF32()    
+    output = ArrowDevArrayF32()
     st = lib.get_sum(c_dev_a_reduce, output.c_arr)
     if st != 0:
-        raise Exception    
-    
+        raise Exception
+
     # get the event so we can tell the stream to wait until the c++ side
     # completes the sum to sync between the streams
     ev = output.get_event()
